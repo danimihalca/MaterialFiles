@@ -17,11 +17,13 @@ import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2CreateOptions
 import com.hierynomus.mssmb2.SMB2MessageCommandCode
 import com.hierynomus.mssmb2.SMB2ShareAccess
+import com.hierynomus.mssmb2.SMB2Dialect
 import com.hierynomus.mssmb2.SMBApiException
 import com.hierynomus.mssmb2.messages.SMB2ChangeNotifyResponse
 import com.hierynomus.protocol.commons.EnumWithValue
 import com.hierynomus.smbj.ProgressListener
 import com.hierynomus.smbj.SMBClient
+import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
 import com.hierynomus.smbj.common.SMBRuntimeException
 import com.hierynomus.smbj.session.Session
@@ -52,8 +54,6 @@ import java.util.concurrent.Future
 object Client {
     @Volatile
     lateinit var authenticator: Authenticator
-
-    private val client = SMBClient()
 
     private val sessions = mutableMapOf<Authority, Session>()
 
@@ -89,29 +89,22 @@ object Client {
         val session = getSession(path.authority)
         val sharePath = path.sharePath
         if (sharePath == null) {
-            val transport = try {
-                SMBTransportFactories.SRVSVC.getTransport(session)
-            } catch (e: IOException) {
-                throw ClientException(e)
-            } catch (e: SMBRuntimeException) {
-                throw ClientException(e)
-            }
-            val serverService = ServerService(transport)
-            val netShareInfos = try {
-                serverService.shares1
-            } catch (e: IOException) {
-                throw ClientException(e)
-            } catch (e: SMBRuntimeException) {
-                throw ClientException(e)
-            }
-            val sharePaths = netShareInfos.mapNotNull {
-                if (!(it.type.hasBits(ShareTypes.STYPE_PRINTQ.value)
-                        || it.type.hasBits(ShareTypes.STYPE_DEVICE.value)
-                        || it.type.hasBits(ShareTypes.STYPE_IPC.value))) {
-                    path.resolve(it.netName)
-                } else {
-                    null
+            val sharePaths = try {
+                val transport = SMBTransportFactories.SRVSVC.getTransport(session)
+                val serverService = ServerService(transport)
+                serverService.shares1.mapNotNull {
+                    if (!(it.type.hasBits(ShareTypes.STYPE_PRINTQ.value)
+                            || it.type.hasBits(ShareTypes.STYPE_DEVICE.value)
+                            || it.type.hasBits(ShareTypes.STYPE_IPC.value))) {
+                        path.resolve(it.netName)
+                    } else {
+                        null
+                    }
                 }
+            } catch (e: Exception) {
+                // SRVSVC RPC is a Windows-specific service not supported on macOS or Linux Samba without RPC.
+                // Fall back to probing common share names.
+                probeShares(session, path)
             }
             return object : CloseableIterator<Path>, Iterator<Path> by sharePaths.iterator() {
                 override fun close() {}
@@ -606,6 +599,7 @@ object Client {
             val password = authenticator.getPassword(authority)
                 ?: throw ClientException("No password found for $authority")
             val hostAddress = resolveHostName(authority.host)
+            val client = getClientFor(authority, password)
             val connection = try {
                 client.connect(hostAddress, authority.port)
             } catch (e: IOException) {
@@ -626,6 +620,34 @@ object Client {
             }!!
             sessions[authority] = session
             return session
+        }
+    }
+
+    private fun getClientFor(authority: Authority, password: String): SMBClient {
+        val isAnonymous = authority.username.isEmpty() && password.isEmpty()
+        val builder = SmbConfig.builder()
+        if (isAnonymous) {
+            // Anonymous/guest sessions: restrict to SMB2 dialects (hierynomus/smbj#792).
+            builder.withDialects(SMB2Dialect.SMB_2_1, SMB2Dialect.SMB_2_0_2)
+        }
+        return SMBClient(builder.build())
+    }
+
+    private fun probeShares(session: Session, rootPath: Path): List<Path> {
+        val username = rootPath.authority.username
+        val candidates = linkedSetOf<String>().apply {
+            if (username.isNotEmpty() && username != "Guest") {
+                add(username)
+            }
+            addAll(listOf("Public", "Shared", "Users", "Data", "Documents", "Downloads", "Media", "Music", "Pictures", "Videos", "Home", "homes", "storage", "share"))
+        }
+        return candidates.mapNotNull { shareName ->
+            try {
+                val share = session.connectShare(shareName) as? DiskShare
+                if (share?.isConnected == true) rootPath.resolve(shareName) else null
+            } catch (e: Exception) {
+                null
+            }
         }
     }
 
